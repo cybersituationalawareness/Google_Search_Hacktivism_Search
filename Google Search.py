@@ -1,3 +1,4 @@
+import argparse
 import configparser
 from datetime import datetime, date
 import os
@@ -5,6 +6,7 @@ import time
 import random
 import json
 import threading
+import re
 import pandas as pd
 import traceback
 from googleapiclient.discovery import build
@@ -23,16 +25,67 @@ QUOTA_STATE_FILE = "quota_state.json"
 QUOTA_LOCK = threading.Lock()
 
 
+def normalize_date_restrict(period):
+    """Normalize a user-friendly period into a dateRestrict string accepted by the
+    Google Custom Search API.
+
+    Accepts values like:
+      - None or '' -> None (no restriction)
+      - 'day', 'week', 'month', 'year'
+      - 'd1', 'w1', 'm1', 'y1'
+      - 'd7', 'm6', 'y2', etc.
+      - numeric+unit like '7d' or '3m' (we normalize to the API form: 'd7' or 'm3')
+
+    Returns a string such as 'd1', 'w1', 'm1', 'y1' or None.
+    """
+    if not period:
+        return None
+    p = str(period).strip().lower()
+    # direct canonical names
+    if p in ('day', 'd', 'd1'):
+        return 'd1'
+    if p in ('week', 'w', 'w1'):
+        return 'w1'
+    if p in ('month', 'm', 'm1'):
+        return 'm1'
+    if p in ('year', 'y', 'y1'):
+        return 'y1'
+
+    # accept already-correct form like 'd7', 'm6', etc.
+    if re.match(r'^\d+[dwmy]$', p):
+        # API expects number then unit? The documented form is number+unit (e.g., 'w1'), so keep as-is if matches
+        # If user wrote '7d' convert to 'd7'
+        m = re.match(r'^(\d+)([dwmy])$', p)
+        if m:
+            num, unit = m.groups()
+            # If user provided '7d' (num before unit) convert
+            if p[0].isdigit() and p.endswith(('d', 'w', 'm', 'y')) and len(p) > 1 and p[0].isdigit():
+                # This branch handles both 'd7' and '7d' because regex matched; ensure API form is number+unit or unit+number?
+                # The Google docs show format like 'd1', 'w1', 'm1', 'y1' (unit+number). We'll prefer unit+number.
+                return f"{unit}{num}"
+        return p
+
+    # accept forms like '7d' or '3m'
+    m = re.match(r'^(\d+)([dwmy])$', p)
+    if m:
+        num, unit = m.groups()
+        return f"{unit}{num}"
+
+    # fallback: none
+    return None
+
+
 def get_google_search_engine_credentials(config_file="google_config.ini"):
     """Reads Google API credentials and optional rate-limit settings from the config file.
 
     NOTE: If DAILY_QUOTA is not provided in the config, we default to 100 (Google free tier).
+    Optionally reads DATE_RESTRICT (user-friendly string) and normalizes it.
     """
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file):
         print(f"ERROR: Configuration file '{config_file}' not found.")
-        return None, None, None, None
+        return None, None, None, None, None
 
     try:
         config.read(config_file)
@@ -52,19 +105,23 @@ def get_google_search_engine_credentials(config_file="google_config.ini"):
             else:
                 daily_quota = 100
 
-            print(f"Using RATE_LIMIT_MIN_INTERVAL_SECONDS={min_interval}, DAILY_QUOTA={daily_quota}")
+            # Optional date restrict from config (e.g., week, month, y1, m6)
+            raw_date_restrict = config['google_api'].get('DATE_RESTRICT', fallback=None)
+            normalized_date_restrict = normalize_date_restrict(raw_date_restrict) if raw_date_restrict else None
 
-            return api_key, cse_id, float(min_interval), daily_quota
+            print(f"Using RATE_LIMIT_MIN_INTERVAL_SECONDS={min_interval}, DAILY_QUOTA={daily_quota}, DATE_RESTRICT={normalized_date_restrict}")
+
+            return api_key, cse_id, float(min_interval), daily_quota, normalized_date_restrict
         else:
             print(f"ERROR: Section '[google_api]' not found in '{config_file}'.")
-            return None, None, None, None
+            return None, None, None, None, None
 
     except KeyError as e:
         print(f"ERROR: Missing key in '{config_file}' under [google_api]: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
     except Exception as e:
         print(f"An unexpected error occurred while reading '{config_file}': {e}")
-        return None, None, None, None
+        return None, None, None, None, None
 
 
 def _load_quota_state(path=QUOTA_STATE_FILE):
@@ -158,12 +215,13 @@ def _extract_retry_after_from_http_error(e):
     return None
 
 
-def programmable_search(service, cse_id, query, retries=MAX_RETRIES, min_interval_seconds=SEARCH_DELAY_SECONDS, daily_quota=None):
+def programmable_search(service, cse_id, query, retries=MAX_RETRIES, min_interval_seconds=SEARCH_DELAY_SECONDS, daily_quota=None, date_restrict=None):
     """
     Performs a search using Google's Custom Search Engine API with robust backoff for rate limits.
     - Wraps calls in a client-side rate limiter (min_interval_seconds).
     - Honors Retry-After when present.
     - Persists a daily counter (if daily_quota is set) to avoid overshooting configured quota.
+    - Accepts date_restrict in API form (e.g., 'w1', 'm1', 'y1', 'd7').
     """
     # Check daily quota before making call
     if daily_quota is not None:
@@ -174,13 +232,16 @@ def programmable_search(service, cse_id, query, retries=MAX_RETRIES, min_interva
 
     @rate_limited(min_interval_seconds=min_interval_seconds)
     def _do_request():
-        return service.cse().list(
+        # Build request kwargs and include dateRestrict if provided
+        request_kwargs = dict(
             q=query,
             cx=cse_id,
             num=10,
-            sort='date',
-            dateRestrict='d1'
-        ).execute()
+            sort='date'
+        )
+        if date_restrict:
+            request_kwargs['dateRestrict'] = date_restrict
+        return service.cse().list(**request_kwargs).execute()
 
     backoff = 1.0
     for attempt in range(1, retries + 1):
@@ -240,8 +301,16 @@ def programmable_search(service, cse_id, query, retries=MAX_RETRIES, min_interva
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Google CSE search runner')
+    parser.add_argument('--period', '-p', help='Optional period to restrict results (e.g. week, month, year, d7, m6)', default=None)
+    args = parser.parse_args()
+
     # Get Credentials + optional rate limit settings
-    API_KEY, CSE_ID, min_interval_seconds, daily_quota = get_google_search_engine_credentials()
+    API_KEY, CSE_ID, min_interval_seconds, daily_quota, config_date_restrict = get_google_search_engine_credentials()
+
+    # Command-line override takes precedence
+    cli_date_restrict = normalize_date_restrict(args.period) if args.period else None
+    date_restrict = cli_date_restrict if cli_date_restrict is not None else config_date_restrict
 
     if not API_KEY or not CSE_ID:
         print("Cannot proceed without valid credentials.")
@@ -255,11 +324,12 @@ def main():
     feeds_data = []
 
     for query in query_list:
-        print(f"\nSearching for: {query}")
+        print(f"\nSearching for: {query} (date_restrict={date_restrict})")
 
         search_results = programmable_search(service, CSE_ID, query, retries=MAX_RETRIES,
                                             min_interval_seconds=min_interval_seconds,
-                                            daily_quota=daily_quota)
+                                            daily_quota=daily_quota,
+                                            date_restrict=date_restrict)
 
         # Extra safety delay after the search (small buffer)
         time.sleep(0.2)
