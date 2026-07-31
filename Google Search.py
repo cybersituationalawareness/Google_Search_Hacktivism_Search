@@ -352,10 +352,29 @@ def main():
             print(f"Title: {item.get('title')}")
 
             try:
-                date, result = get_text_from_slow_site(link)
+                raw = get_text_from_slow_site(link)
+
+                # Robust unpacking: accept tuple/list of various lengths or a single value
+                date = None
+                result = None
+                if isinstance(raw, (tuple, list)):
+                    if len(raw) >= 2:
+                        date, result = raw[0], raw[1]
+                    elif len(raw) == 1:
+                        date, result = None, raw[0]
+                    else:
+                        date, result = None, None
+                else:
+                    # single non-sequence return value (string or None, etc.)
+                    date, result = None, raw
+
+                # Debug/logging to help identify unexpected return shapes (can remove later)
+                if not (isinstance(raw, (tuple, list)) and len(raw) == 2):
+                    print(f"DEBUG: get_text_from_slow_site returned unexpected shape for {link}: {raw!r}")
+
                 time.sleep(1)  # Small pause to relieve site / local Ollama server
 
-                if result == "Error":
+                if result == "Error" or result is None:
                     continue
 
                 if is_aviation_cyber_incident(result):
